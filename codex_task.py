@@ -3,12 +3,12 @@
 
 Cross-platform (macOS, Linux, Windows), standard library only, Python 3.9+.
 Every run gets an audit folder with the prompt, command, event stream, final message
-and meta.json (model, effort, sandbox, network, Fast mode, session id, exit code,
-git HEAD before/after, files changed during the run).
+and meta.json (model, effort, sandbox, network, Fast mode, auth, token usage, session id,
+exit code, git HEAD before/after, files changed during the run).
 
 Usage:
   python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
-                       [--model <id>] [--network] [--fast|--no-fast]
+                       [--model <id>] [--network] [--fast|--no-fast] [--auth <login|api>]
                        [--resume <session_id>] [--wait <seconds>]
                        [--root <repo>] [--prompt-file <path>]   (prompt may also come on stdin)
 
@@ -45,6 +45,9 @@ DEFAULTS = {
     "lock_dir": "",                        # empty: ~/.codex-worker/locks (machine-wide slots)
     "require_git": True,
     "exclude_from_changes": [],            # extra path prefixes ignored in changed_files
+    # login: whatever `codex login` stored; api: pass the key from api_key_env to this run only
+    "auth": "login",
+    "api_key_env": "OPENAI_API_KEY",
 }
 
 
@@ -214,7 +217,7 @@ def git_head(root):
 
 
 def scan_events(path):
-    thread_id, service_tier = None, None
+    thread_id, service_tier, usage = None, None, {}
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -229,9 +232,13 @@ def scan_events(path):
                     thread_id = ev.get("thread_id")
                 if service_tier is None and "service_tier" in ev:
                     service_tier = ev["service_tier"]
+                if ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
+                    for k, v in ev["usage"].items():
+                        if isinstance(v, int):
+                            usage[k] = usage.get(k, 0) + v
     except OSError:
         pass
-    return thread_id, service_tier
+    return thread_id, service_tier, usage or None
 
 
 def main():
@@ -242,6 +249,8 @@ def main():
     ap.add_argument("--network", action="store_true")
     ap.add_argument("--fast", dest="fast", action="store_true", default=None)
     ap.add_argument("--no-fast", dest="fast", action="store_false")
+    ap.add_argument("--auth", choices=["login", "api"],
+                    help="login: the stored `codex login`; api: API key from api_key_env (default: config auth)")
     ap.add_argument("--resume", default="")
     ap.add_argument("--wait", type=int, default=0)
     ap.add_argument("--root", default="")
@@ -268,6 +277,17 @@ def main():
     if fast and not cfg["allow_fast"]:
         print("Fast is switched off in the config (allow_fast=false); running without it.", file=sys.stderr)
         fast = False
+
+    auth = a.auth or cfg["auth"]
+    if auth not in ("login", "api"):
+        die(f"auth must be login or api, not '{auth}'")
+    env = dict(os.environ)
+    env.pop("CODEX_API_KEY", None)       # login mode must not silently bill an API key
+    if auth == "api":
+        key = os.environ.get(cfg["api_key_env"], "").strip()
+        if not key:
+            die(f"--auth api: environment variable {cfg['api_key_env']} is not set")
+        env["CODEX_API_KEY"] = key       # read by `codex exec` for this run only; never written to disk
 
     codex = find_codex(cfg)
     preamble = os.path.expanduser(cfg["preamble"]) if cfg["preamble"] else os.path.join(HERE, "preamble.md")
@@ -362,7 +382,7 @@ def main():
                 open(os.path.join(run_dir, "events.jsonl"), "wb") as fout, \
                 open(os.path.join(run_dir, "stderr.log"), "wb") as ferr:
             try:
-                rc = subprocess.run(cmd, cwd=root, stdin=fin, stdout=fout, stderr=ferr).returncode
+                rc = subprocess.run(cmd, cwd=root, env=env, stdin=fin, stdout=fout, stderr=ferr).returncode
             except KeyboardInterrupt:
                 rc = 130
 
@@ -370,7 +390,7 @@ def main():
         after = snapshot(root, excludes)
         head_after = git_head(root)
         changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
-        thread_id, tier = scan_events(os.path.join(run_dir, "events.jsonl"))
+        thread_id, tier, usage = scan_events(os.path.join(run_dir, "events.jsonl"))
         meta = {
             "name": a.name, "run_dir": run_dir, "cwd": root,
             "start_utc": start, "end_utc": end,
@@ -380,6 +400,8 @@ def main():
             "extra_preambles": a.extras,
             "fast_mode": "on (service_tier=priority)" if fast else "off (service_tier=default)",
             "service_tier_reported": tier,
+            "auth": f"api key ({cfg['api_key_env']})" if auth == "api" else "codex login",
+            "usage": usage,
             "resumed_session_id": a.resume or None,
             "session_id": thread_id or (a.resume or None),
             "exit_code": rc,

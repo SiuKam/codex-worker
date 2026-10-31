@@ -68,7 +68,8 @@ class WrapperTest(unittest.TestCase):
 
     def run_wrapper(self, *args, prompt="do the thing", env=None, background=False):
         e = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
-        e.pop("CODEX_BIN", None)
+        for k in ("CODEX_BIN", "CODEX_API_KEY", "OPENAI_API_KEY"):
+            e.pop(k, None)
         e.update(env or {})
         cmd = [sys.executable, WRAPPER, *args]
         if background:
@@ -151,6 +152,33 @@ class WrapperTest(unittest.TestCase):
     def test_empty_prompt(self):
         r = self.run_wrapper("--name", "t7", "--effort", "low", prompt="   ")
         self.assertEqual(r.returncode, 2)
+
+    def test_auth_api(self):
+        r = self.run_wrapper("--name", "t8", "--effort", "low", "--auth", "api")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("OPENAI_API_KEY is not set", r.stderr)
+        r = self.run_wrapper("--name", "t8b", "--effort", "low", "--auth", "api",
+                             env={"OPENAI_API_KEY": "sk-test-secret"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("auth=api", r.stdout)
+        rd, m = self.meta(r.stdout)
+        self.assertEqual(m["auth"], "api key (OPENAI_API_KEY)")
+        self.assertEqual(m["usage"], {"input_tokens": 100, "output_tokens": 7})
+        for fn in os.listdir(rd):
+            with open(os.path.join(rd, fn), encoding="utf-8", errors="replace") as f:
+                self.assertNotIn("sk-test-secret", f.read(), fn)
+
+    def test_auth_login_strips_api_key(self):
+        r = self.run_wrapper("--name", "t9", "--effort", "low", env={"CODEX_API_KEY": "sk-stray"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("auth=login", r.stdout)
+        _, m = self.meta(r.stdout)
+        self.assertEqual(m["auth"], "codex login")
+        self.config({"auth": "api", "api_key_env": "MY_KEY"})
+        r = self.run_wrapper("--name", "t9b", "--effort", "low", env={"MY_KEY": "k"})
+        self.assertIn("auth=api", r.stdout)
+        r = self.run_wrapper("--name", "t9c", "--effort", "low", "--auth", "login", env={"MY_KEY": "k"})
+        self.assertIn("auth=login", r.stdout)
 
 
 if __name__ == "__main__":

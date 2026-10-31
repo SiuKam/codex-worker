@@ -5,6 +5,7 @@
 writes the -o last-message file, and, if the prompt contains WRITE_FILE=<name>,
 creates that file in the working directory so changed_files can be tested.
 FAKE_SLEEP (seconds) delays the run; FAKE_RC sets the exit code.
+The last message reports auth=api when CODEX_API_KEY is set (never the key itself).
 """
 import json
 import os
@@ -29,5 +30,6 @@ if m:
         f.write("written by fake codex\n")
 with open(out, "w", encoding="utf-8") as f:
     f.write("FAKE DONE\nargs=" + json.dumps(args) + "\n")
-print(json.dumps({"type": "turn.completed"}), flush=True)
+    f.write("auth=" + ("api" if os.environ.get("CODEX_API_KEY") else "login") + "\n")
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}}), flush=True)
 sys.exit(int(os.environ.get("FAKE_RC", "0")))

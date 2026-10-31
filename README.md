@@ -35,13 +35,14 @@
 
 ```
 python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
-                     [--model <id>] [--network] [--fast | --no-fast]
+                     [--model <id>] [--network] [--fast | --no-fast] [--auth <login|api>]
                      [--resume <session_id>] [--wait <秒>] [--root <仓库>]
                      [--with <额外前言名>] [--prompt-file <文件>]     # 也可以从标准输入传入任务
 ```
 
 - **模型**：只接受配置里 `allowed_models` 列出的模型，第一个是默认值。
 - **Fast**：Fast 就是 Codex 的 `priority` 服务档。默认关闭，`--fast` 开启。在配置里设 `allow_fast: false` 后，`--fast` 一律无效。
+- **登录方式**：默认 `--auth login`，用 `codex login` 存下的登录（例如 ChatGPT 账号）。`--auth api` 只让这一次运行改用 API key 计费：key 从环境变量 `OPENAI_API_KEY`（可用 `api_key_env` 改名）读取，以 `CODEX_API_KEY` 传给 Codex，不写入任何文件，也不改动 `codex login` 的登录。用 API 额度时，Fast 会按更贵的 priority 档计费。
 - **沙箱**：沙箱为 `workspace-write`，审批为 `never`；不加 `--network` 时不联网。
 - **继续任务**：`--resume <session_id>` 继续之前的会话，session id 在上次运行的输出和 `meta.json` 里。
 - **退出码**：退出码与 Codex 的相同。`2` 表示参数或规则错误；`75` 表示并发名额已满，可以加 `--wait 600` 排队等待。
@@ -62,7 +63,9 @@ python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
   "extra_preambles": {"browser": "tools/codex/browser_preflight.md"},
   "lock_dir": "",
   "require_git": true,
-  "exclude_from_changes": []
+  "exclude_from_changes": [],
+  "auth": "login",
+  "api_key_env": "OPENAI_API_KEY"
 }
 ```
 
@@ -73,7 +76,7 @@ python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
   - `events.jsonl`
   - `last_message.md`
   - `stderr.log`
-  - `meta.json`：模型、推理强度、Fast、session id、退出码、运行前后的 git HEAD，以及运行期间改动的文件
+  - `meta.json`：模型、推理强度、Fast、登录方式、token 用量、session id、退出码、运行前后的 git HEAD，以及运行期间改动的文件
 - **`codex_bin`**：留空时自动查找 Codex：先查 `PATH`，再查 Windows 的 `%APPDATA%\npm\codex.cmd`、macOS 的 `~/.local/bin/codex` 和 Homebrew 路径。也可以用环境变量 `CODEX_BIN` 指定。
 - **`preamble` / `extra_preambles`**：相对路径都按仓库根目录解析。`--with browser` 会在任务前再加上对应的说明文件。
 
@@ -85,7 +88,7 @@ python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
 python -m unittest discover -s tests -v
 ```
 
-测试内容：正常运行、模型限制、Fast 开关、继续会话、退出码透传、并发名额与回收、空任务。已在 macOS 上用 Python 3.9 和 3.12 测试通过，并用真实的 Codex CLI 0.163.0 做过一次冒烟测试。在 Windows 11 上用 Python 3.12 测试通过，并用真实的 Codex CLI 0.164.0（`codex.exe`）做过一次冒烟测试。
+测试内容：正常运行、模型限制、Fast 开关、登录方式、继续会话、退出码透传、并发名额与回收、空任务。已在 macOS 上用 Python 3.9 和 3.12 测试通过，并用真实的 Codex CLI 0.163.0 做过一次冒烟测试。在 Windows 11 上用 Python 3.12 测试通过，并用真实的 Codex CLI 0.164.0（`codex.exe`）做过一次冒烟测试。
 
 Windows 上使用 `codex.cmd` 时，路径和其他参数不能包含 `%` 或 `!`。如需使用这些字符，请将 `codex_bin` 设置为 `codex.exe` 或 node 入口。wrapper 用 `cmd.exe /d` 启动 `.cmd`，跳过 cmd.exe 的 AutoRun（例如 conda/mamba 的初始化脚本），否则 AutoRun 可能把传给 Codex 的任务内容读空。
 
@@ -107,6 +110,7 @@ Windows 上使用 `codex.cmd` 时，路径和其他参数不能包含 `%` 或 `!
 - **Models**: only those in `allowed_models`; the first one is the default.
 - **Fast**: off by default. `--fast` turns it on; `allow_fast: false` disables it entirely.
 - **Sandbox**: `workspace-write` sandbox, approval `never`. Network is off unless `--network` is given.
+- **Auth**: `--auth login` (default) uses the stored `codex login`. `--auth api` bills this run to an API key read from `OPENAI_API_KEY` (rename with `api_key_env`); it is passed to Codex as `CODEX_API_KEY`, never written to disk, and the stored login is left alone. `meta.json` records the auth mode and token usage.
 - **Concurrency**: limited per machine by `max_concurrent`. Slots left by dead processes are reclaimed.
 - **Exit codes**: the wrapper returns Codex's exit code. `2` means an argument or policy error; `75` means all slots are busy (add `--wait <seconds>`).
 
