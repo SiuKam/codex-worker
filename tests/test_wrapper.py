@@ -229,6 +229,21 @@ class WrapperTest(unittest.TestCase):
             with open(os.path.join(rd, fn), encoding="utf-8", errors="replace") as f:
                 self.assertNotIn("sk-test-secret", f.read(), fn)
 
+    def test_auth_api_key_command(self):
+        self.config({"api_key_command": [sys.executable, "-c", "print('sk-from-command')"]})
+        r = self.run_wrapper("--name", "t14", "--effort", "low", "--auth", "api")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("auth=api", r.stdout)
+        rd, m = self.meta(r.stdout)
+        self.assertEqual(m["auth"], "api key (api_key_command)")
+        self.assertIn("forced_login_method=", m["command"])
+        for fn in os.listdir(rd):
+            with open(os.path.join(rd, fn), encoding="utf-8", errors="replace") as f:
+                self.assertNotIn("sk-from-command", f.read(), fn)
+        self.config({"api_key_command": [sys.executable, "-c", "import sys; sys.exit(1)"]})
+        r = self.run_wrapper("--name", "t14b", "--effort", "low", "--auth", "api")
+        self.assertEqual(r.returncode, 2)
+
     def test_auth_login_strips_api_key(self):
         r = self.run_wrapper("--name", "t9", "--effort", "low", env={"CODEX_API_KEY": "sk-stray"})
         self.assertEqual(r.returncode, 0, r.stderr)

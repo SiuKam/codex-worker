@@ -44,7 +44,7 @@ python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
 
 - **模型**：只接受配置里 `allowed_models` 列出的模型，第一个是默认值。
 - **Fast**：Fast 就是 Codex 的 `priority` 服务档。默认关闭，`--fast` 开启。在配置里设 `allow_fast: false` 后，`--fast` 一律无效。
-- **登录方式**：默认 `--auth login`，用 `codex login` 存下的登录（例如 ChatGPT 账号）。`--auth api` 只让这一次运行改用 API key 计费：key 从环境变量 `OPENAI_API_KEY`（可用 `api_key_env` 改名）读取，以 `CODEX_API_KEY` 传给 Codex，不写入任何文件，也不改动 `codex login` 的登录。用 API 额度时，Fast 会按更贵的 priority 档计费。
+- **登录方式**：默认 `--auth login`，用 `codex login` 存下的登录（例如 ChatGPT 账号）。`--auth api` 只让这一次运行改用 API key 计费：key 从环境变量 `OPENAI_API_KEY`（可用 `api_key_env` 改名）读取，以 `CODEX_API_KEY` 传给 Codex，不写入任何文件，也不改动 `codex login` 的登录。也可以在配置里设 `api_key_command`，用一条命令取 key，例如从 macOS 钥匙串取：`["/usr/bin/security", "find-generic-password", "-a", "$USER", "-s", "<服务名>", "-w"]`。wrapper 还会传 `forced_login_method`，保证用 API key 时不会悄悄退回账号登录，反之亦然。用 API 额度时，Fast 会按更贵的 priority 档计费。
 - **沙箱和审批**：沙箱固定为 `workspace-write`。默认 `--approvals auto`：Codex 要做沙箱不允许的事（联网、写项目外的文件、运行被拦下的命令）时，先申请，由 Codex 的 Auto-review 审阅模型当场批准或拒绝（`approval_policy=on-request` 加 `approvals_reviewer=auto_review`）。Codex 不一定会主动申请（比如联网失败时它可能直接汇报失败），所以这个模式下 wrapper 会在任务里加一句提示：被沙箱挡住就申请放开，被拒绝就不要绕。它会拦下外传密钥或隐私、翻找密码和 cookie、大范围削弱安全设置、高风险且不可逆的破坏；连续被拒 3 次或最近 50 次里被拒 10 次，这一轮会中断。它不是确定的安全保证。`--approvals never`（或配置 `approvals: "never"`）恢复旧行为：被沙箱挡住的操作直接失败。`--network` 等于事先允许联网，不必逐次审阅。
 - **继续任务**：`--resume <session_id>` 继续指定的会话。`--continue` 继续这个仓库里同一个 `--name` 最近一次的会话（记录在 `<runs_dir>/sessions.json`），Codex 记得上次读过、改过什么。
 - **浏览器**：`--browser` 让 Codex 通过 Codex Chrome 扩展操作你自己的浏览器（带着你的登录状态），并在任务前加上 `browser_preflight.md`。Codex 自带的 `cua_repl` 在桌面应用以外会报 “The browser access host is unavailable”（[openai/codex#57641](https://github.com/openai/codex/issues/57641)），所以这里用社区找到的绕法：在 Codex 的 `node_repl` 工具里加载插件自带的 `browser-client.mjs` 并调用 `setupBrowserRuntime()`。这条路没有官方支持，等于绕过了桌面应用的授权，以后的更新可能让它失效。预检要求 Codex 回报 `BROWSER_PREFLIGHT: OK` 或 `FAIL`，只用一个专用标签页，不许输入密码、处理验证码、购买、接受新条款，也不许改插件文件和授权变量。`meta.json` 的 `browser_evidence` 记下 `node_repl` 调用次数、失败次数、初始化次数和预检结果。前提：Chrome 里装了 Codex 扩展，`~/.codex/config.toml` 里有 `[mcp_servers.node_repl]`（装了 ChatGPT 桌面应用会自动写入）。不需要 `--network`。配置 `allow_browser: false` 可彻底关掉。Windows 上还没验证过。
@@ -72,11 +72,12 @@ python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
   "exclude_from_changes": [],
   "track_changes": true,
   "auth": "login",
-  "api_key_env": "OPENAI_API_KEY"
+  "api_key_env": "OPENAI_API_KEY",
+  "api_key_command": []
 }
 ```
 
-- **`max_concurrent`**：限制整台电脑同时跑的数量。名额是 `~/.codex-worker/locks/` 下的文件夹，进程意外退出后留下的名额会自动回收。
+- **`max_concurrent` / `lock_dir`**：限制同时跑的数量。名额是 `lock_dir`（默认 `~/.codex-worker/locks/`，整台电脑共用；相对路径按仓库根目录解析，可让某个项目单独计数）下的文件夹，进程意外退出后留下的名额会自动回收。
 - **`runs_dir`**：每次运行的记录放在 `<runs_dir>/<UTC时间>_<name>/`，里面有：
   - `prompt.md`
   - `command.txt`
@@ -131,7 +132,7 @@ Windows 上使用 `codex.cmd` 时，路径和其他参数不能包含 `%` 或 `!
 - **Continue**: `--continue` resumes the last session recorded for the same `--name` in this repository (`<runs_dir>/sessions.json`); `--resume <id>` resumes a given session.
 - **Browser**: `--browser` lets Codex drive your own browser through the Codex Chrome extension, using the community workaround from [openai/codex#57641](https://github.com/openai/codex/issues/57641) (`setupBrowserRuntime()` from the plugin's `browser-client.mjs` inside the `node_repl` tool), because `cua_repl` reports "The browser access host is unavailable" outside the desktop app. Unsupported; it bypasses the desktop app's authorization and may break with any update. The preflight requires one dedicated tab, `BROWSER_PREFLIGHT: OK|FAIL`, and forbids credentials, CAPTCHAs, purchases, new terms and touching plugin files. `meta.json` records `browser_evidence`. `allow_browser: false` turns it off. Not yet verified on Windows.
 - **Context**: Codex starts fresh each run. Put style rules and example file paths in `AGENTS.md` (repository or `~/.codex/AGENTS.md`), use `--continue` for follow-ups, and optionally enable Codex memories. Both AGENTS.md and `--continue` add input tokens each turn; most hit the cache.
-- **Auth**: `--auth login` (default) uses the stored `codex login`. `--auth api` bills this run to an API key read from `OPENAI_API_KEY` (rename with `api_key_env`); it is passed to Codex as `CODEX_API_KEY`, never written to disk, and the stored login is left alone. `meta.json` records the auth mode and token usage.
+- **Auth**: `--auth login` (default) uses the stored `codex login`. `--auth api` bills this run to an API key read from `OPENAI_API_KEY` (rename with `api_key_env`); it is passed to Codex as `CODEX_API_KEY`, never written to disk, and the stored login is left alone. `api_key_command` (e.g. a macOS Keychain lookup) can supply the key instead; `forced_login_method` is set so a run never silently falls back to the other login. `meta.json` records the auth mode and token usage.
 - **Changed files**: before and after each run the wrapper runs `git status` and compares only size and modification time of dirty/untracked files (no content reads, nothing sent to Codex). `exclude_from_changes` skips path prefixes; `track_changes: false` turns the scan off.
 - **Concurrency**: limited per machine by `max_concurrent`. Slots left by dead processes are reclaimed.
 - **Exit codes**: the wrapper returns Codex's exit code. `2` means an argument or policy error; `75` means all slots are busy (add `--wait <seconds>`).

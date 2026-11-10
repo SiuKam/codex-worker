@@ -57,6 +57,8 @@ DEFAULTS = {
     # login: whatever `codex login` stored; api: pass the key from api_key_env to this run only
     "auth": "login",
     "api_key_env": "OPENAI_API_KEY",
+    # optional command printing the key (e.g. macOS Keychain); used instead of api_key_env when set
+    "api_key_command": [],
 }
 
 
@@ -83,10 +85,10 @@ def find_root(start):
         out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
                              capture_output=True, text=True)
         if out.returncode == 0 and out.stdout.strip():
-            return os.path.abspath(out.stdout.strip())
+            return os.path.realpath(out.stdout.strip())
     except FileNotFoundError:
         pass
-    return os.path.abspath(start)
+    return os.path.realpath(start)             # physical path: the Codex sandbox rejects symlinked writable roots
 
 
 def find_codex(cfg):
@@ -339,9 +341,19 @@ def main():
     env = dict(os.environ)
     env.pop("CODEX_API_KEY", None)       # login mode must not silently bill an API key
     if auth == "api":
-        key = os.environ.get(cfg["api_key_env"], "").strip()
-        if not key:
-            die(f"--auth api: environment variable {cfg['api_key_env']} is not set")
+        if cfg["api_key_command"]:
+            try:
+                out = subprocess.run([os.path.expandvars(c) for c in cfg["api_key_command"]],
+                                     capture_output=True, text=True)
+            except OSError as e:
+                die(f"--auth api: cannot run api_key_command: {e}")
+            key = out.stdout.strip() if out.returncode == 0 else ""
+            if not key:
+                die(f"--auth api: api_key_command printed no key (exit {out.returncode})")
+        else:
+            key = os.environ.get(cfg["api_key_env"], "").strip()
+            if not key:
+                die(f"--auth api: environment variable {cfg['api_key_env']} is not set")
         env["CODEX_API_KEY"] = key       # read by `codex exec` for this run only; never written to disk
 
     codex = find_codex(cfg)
@@ -388,6 +400,8 @@ def main():
             die(f"--continue: no earlier session recorded for --name {a.name} in {sessions_file}")
 
     lock_dir = os.path.expanduser(cfg["lock_dir"]) if cfg["lock_dir"] else os.path.join(os.path.expanduser("~"), ".codex-worker", "locks")
+    if not os.path.isabs(lock_dir):
+        lock_dir = os.path.join(root, lock_dir)
     slot = acquire_slot(lock_dir, int(cfg["max_concurrent"]), a.wait)
     if not slot:
         die(f"Concurrency limit reached ({cfg['max_concurrent']} Codex runs active). Retry later or use --wait <seconds>.", 75)
@@ -434,6 +448,7 @@ def main():
             "-c", f'approval_policy={quote}{"on-request" if approvals == "auto" else "never"}{quote}',
         ] + (["-c", f'approvals_reviewer={quote}auto_review{quote}'] if approvals == "auto" else []) + [
             "-c", f'service_tier={quote}{"priority" if fast else "default"}{quote}',
+            "-c", f'forced_login_method={quote}{"api" if auth == "api" else "chatgpt"}{quote}',
             "-c", f"sandbox_workspace_write.network_access={'true' if a.network else 'false'}",
             "--json", "-o", os.path.join(run_dir, "last_message.md"),
         ]
@@ -476,7 +491,8 @@ def main():
             "browser_evidence": browser if a.browser or browser["cua_repl_calls"] or browser["runtime_setups"] else None,
             "fast_mode": "on (service_tier=priority)" if fast else "off (service_tier=default)",
             "service_tier_reported": tier,
-            "auth": f"api key ({cfg['api_key_env']})" if auth == "api" else "codex login",
+            "auth": ("api key (api_key_command)" if cfg["api_key_command"] else f"api key ({cfg['api_key_env']})")
+                    if auth == "api" else "codex login",
             "usage": usage,
             "resumed_session_id": resume or None,
             "continued": a.cont,
