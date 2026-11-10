@@ -101,6 +101,13 @@ class WrapperTest(unittest.TestCase):
         self.assertTrue(os.path.realpath(rd).startswith(os.path.join(os.path.realpath(self.repo), ".codex_runs")))
         self.assertEqual(os.listdir(os.path.join(self.tmp, "locks")), [])
 
+    def test_track_changes_off(self):
+        self.config({"track_changes": False})
+        r = self.run_wrapper("--name", "t13", "--effort", "low", prompt="hello WRITE_FILE=out.txt")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, m = self.meta(r.stdout)
+        self.assertIsNone(m["changed_files"])
+
     def test_model_policy(self):
         r = self.run_wrapper("--name", "t2", "--effort", "low", "--model", "other-model")
         self.assertEqual(r.returncode, 2)
@@ -152,6 +159,60 @@ class WrapperTest(unittest.TestCase):
     def test_empty_prompt(self):
         r = self.run_wrapper("--name", "t7", "--effort", "low", prompt="   ")
         self.assertEqual(r.returncode, 2)
+
+    def test_approvals(self):
+        r = self.run_wrapper("--name", "t11", "--effort", "low")
+        _, m = self.meta(r.stdout)
+        self.assertEqual((m["approval_policy"], m["approvals_reviewer"]), ("on-request", "auto_review"))
+        self.assertIn("approvals_reviewer=", m["command"])
+        with open(os.path.join(m["run_dir"], "prompt.md"), encoding="utf-8") as f:
+            self.assertIn("escalated permissions", f.read())
+        r = self.run_wrapper("--name", "t11b", "--effort", "low", "--approvals", "never")
+        _, m = self.meta(r.stdout)
+        self.assertEqual((m["approval_policy"], m["approvals_reviewer"]), ("never", None))
+        self.assertNotIn("approvals_reviewer", m["command"])
+        self.config({"approvals": "never"})
+        r = self.run_wrapper("--name", "t11c", "--effort", "low")
+        _, m = self.meta(r.stdout)
+        self.assertEqual(m["approval_policy"], "never")
+
+    def test_continue(self):
+        r = self.run_wrapper("--name", "t12", "--effort", "low", "--continue")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no earlier session", r.stderr)
+        r = self.run_wrapper("--name", "t12", "--effort", "low")
+        _, m = self.meta(r.stdout)
+        self.assertEqual(m["session_id"], "fake-thread-0001")
+        r = self.run_wrapper("--name", "t12", "--effort", "low", "--continue")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, m = self.meta(r.stdout)
+        self.assertTrue(m["continued"])
+        self.assertEqual(m["resumed_session_id"], "fake-thread-0001")
+        self.assertIn(" resume ", " " + m["command"] + " ")
+        r = self.run_wrapper("--name", "t12", "--effort", "low", "--continue", "--resume", "x")
+        self.assertEqual(r.returncode, 2)
+
+    def test_browser(self):
+        r = self.run_wrapper("--name", "t10", "--effort", "low")
+        _, m = self.meta(r.stdout)
+        self.assertFalse(m["browser_mode"])
+        self.assertIsNone(m["browser_evidence"])
+        r = self.run_wrapper("--name", "t10b", "--effort", "low", "--browser")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("BROWSER: ", r.stdout)
+        rd, m = self.meta(r.stdout)
+        with open(os.path.join(rd, "prompt.md"), encoding="utf-8") as f:
+            p = f.read()
+        self.assertLess(p.index("ASSIGNED TASK BELOW"), p.index("Browser preflight"))
+        self.assertTrue(m["browser_mode"])
+        self.assertFalse(m["network"])
+        self.assertEqual(m["browser_evidence"], {
+            "node_repl_calls": 1, "node_repl_failed": 0, "runtime_setups": 1, "cua_repl_calls": 0,
+            "preflight": "BROWSER_PREFLIGHT: OK browser=Chrome profile=Default"})
+        self.config({"allow_browser": False})
+        r = self.run_wrapper("--name", "t10c", "--effort", "low", "--browser")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("allow_browser", r.stderr)
 
     def test_auth_api(self):
         r = self.run_wrapper("--name", "t8", "--effort", "low", "--auth", "api")

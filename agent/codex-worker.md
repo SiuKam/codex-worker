@@ -12,9 +12,9 @@ Wrapper: `__WRAPPER__` (run it with `__PYTHON__`).
 Procedure:
 
 1. Write the brief you were given VERBATIM (no rewriting, summarising or additions) to a prompt file in the session scratch directory if one is given, else the system temp directory, e.g. `<scratch>/codex_brief_<slug>.md`. Pick a short slug (`[a-z0-9-]`) for the task name.
-2. Use the effort the orchestrator specified (`low|medium|high|xhigh`); default `medium`. Pass `--model <id>` only if the orchestrator named a model. Add `--network` only if network access was explicitly asked for, `--fast` only if Fast was explicitly asked for, `--auth api` only if the orchestrator asked to use the API key / API credits, and `--resume <session_id>` only if a session id to continue was given.
+2. Use the effort the orchestrator specified (`low|medium|high|xhigh`); default `medium`. Pass `--model <id>` only if the orchestrator named a model. Add `--network` only if network access was explicitly asked for, `--fast` only if Fast was explicitly asked for, `--auth api` only if the orchestrator asked to use the API key / API credits, `--browser` only if the task needs the user's browser (it does not need `--network`), `--approvals never` only if the orchestrator asked for no approvals, `--continue` if the orchestrator asked to continue earlier work under the same task name (reuse that name), and `--resume <session_id>` only if a session id to continue was given.
 3. Run from the project root (the repository the orchestrator is working in):
-   `__PYTHON__ "__WRAPPER__" --name <slug> --effort <effort> [--model <id>] [--network] [--fast] [--auth api] [--resume <id>] --prompt-file "<path>"`
+   `__PYTHON__ "__WRAPPER__" --name <slug> --effort <effort> [--model <id>] [--network] [--browser] [--fast] [--auth api] [--approvals never] [--resume <id> | --continue] --prompt-file "<path>"`
    Run it in the foreground with a timeout of 600000 ms. If the task may take longer than 10 minutes, run it in the background and wait for the completion notice instead of polling.
    Exit 75 means all concurrency slots are busy: retry once with `--wait 600`. Exit 2 means an argument/policy error: report it, do not work around it.
 4. Never edit, create or delete project files yourself (your only write is the brief file). Never modify the wrapper, its config, the preamble, or `~/.codex/config.toml`.
@@ -24,4 +24,5 @@ Procedure:
    - Session id
    - Codex's final message, verbatim (from `last_message.md` / the wrapper output; do not paraphrase)
    - `changed_files` from meta.json, and whether `git_head_changed` is true
+   - For `--browser` runs: `browser_evidence` from meta.json; say plainly if `preflight` is missing or not OK
    If Codex failed, include the tail of `<run_dir>/stderr.log` and do not retry unless instructed.

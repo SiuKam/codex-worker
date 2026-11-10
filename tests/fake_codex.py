@@ -6,6 +6,7 @@ writes the -o last-message file, and, if the prompt contains WRITE_FILE=<name>,
 creates that file in the working directory so changed_files can be tested.
 FAKE_SLEEP (seconds) delays the run; FAKE_RC sets the exit code.
 The last message reports auth=api when CODEX_API_KEY is set (never the key itself).
+If the prompt carries the browser preflight, it emits one node_repl call and a preflight line.
 """
 import json
 import os
@@ -24,6 +25,12 @@ resume = "resume" in args
 tid = args[args.index("-") - 1] if resume else "fake-thread-0001"
 print(json.dumps({"type": "thread.started", "thread_id": tid}), flush=True)
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
+if "BROWSER_PREFLIGHT" in prompt:
+    print(json.dumps({"type": "item.completed", "item": {
+        "type": "mcp_tool_call", "server": "node_repl", "tool": "js", "status": "completed",
+        "arguments": {"code": "const agent = await setupBrowserRuntime();"}}}), flush=True)
+    print(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "BROWSER_PREFLIGHT: OK browser=Chrome profile=Default"}}), flush=True)
 m = re.search(r"WRITE_FILE=(\S+)", prompt)
 if m:
     with open(m.group(1), "w", encoding="utf-8") as f:

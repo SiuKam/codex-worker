@@ -8,8 +8,8 @@ exit code, git HEAD before/after, files changed during the run).
 
 Usage:
   python codex_task.py --name <slug> --effort <low|medium|high|xhigh>
-                       [--model <id>] [--network] [--fast|--no-fast] [--auth <login|api>]
-                       [--resume <session_id>] [--wait <seconds>]
+                       [--model <id>] [--network] [--browser] [--fast|--no-fast] [--auth <login|api>]
+                       [--approvals <auto|never>] [--resume <session_id> | --continue] [--wait <seconds>]
                        [--root <repo>] [--prompt-file <path>]   (prompt may also come on stdin)
 
 Settings come from built-in defaults, then ~/.codex-worker/config.json, then
@@ -17,7 +17,6 @@ Settings come from built-in defaults, then ~/.codex-worker/config.json, then
 """
 import argparse
 import datetime
-import hashlib
 import json
 import os
 import re
@@ -28,6 +27,10 @@ import time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+APPROVALS_NOTE = ("Approvals: if the sandbox blocks something this task needs (network access, a write outside "
+                  "the workspace, a blocked command), retry that command with escalated permissions and a one-line "
+                  "justification instead of giving up. Requests are reviewed automatically; if one is denied, "
+                  "do not try to work around the denial.")
 IS_WIN = os.name == "nt"
 
 DEFAULTS = {
@@ -38,6 +41,11 @@ DEFAULTS = {
     "fast_default": False,
     # set false to make --fast a no-op (a hard "Fast off" switch)
     "allow_fast": True,
+    # auto: Codex Auto-review decides each sandbox escalation; never: blocked actions just fail
+    "approvals": "auto",
+    # --browser: drive the user's browser through the Codex Chrome extension (see browser_preflight.md)
+    "allow_browser": True,
+    "browser_preamble": "",                # empty: browser_preflight.md next to this script
     "codex_bin": "",                       # empty: auto-detect
     "runs_dir": ".codex_runs",             # relative to the repo root
     "preamble": "",                        # empty: preamble.md next to this script
@@ -45,6 +53,7 @@ DEFAULTS = {
     "lock_dir": "",                        # empty: ~/.codex-worker/locks (machine-wide slots)
     "require_git": True,
     "exclude_from_changes": [],            # extra path prefixes ignored in changed_files
+    "track_changes": True,                 # false: skip the before/after git status scan entirely
     # login: whatever `codex login` stored; api: pass the key from api_key_env to this run only
     "auth": "login",
     "api_key_env": "OPENAI_API_KEY",
@@ -173,12 +182,13 @@ def utcnow(fmt="%Y-%m-%dT%H:%M:%SZ"):
     return datetime.datetime.now(datetime.timezone.utc).strftime(fmt)
 
 
-# ---- dirty-state snapshot: path -> (status, content hash) for every dirty/untracked file ----
+# ---- dirty-state snapshot: path -> (status, size:mtime) for every dirty/untracked file ----
+# Only stat() each file: hashing would read every untracked file (gigabytes in data-heavy repos) twice per run.
 
 def snapshot(root, excludes):
     try:
         out = subprocess.run(["git", "status", "--porcelain", "-uall", "-z"], cwd=root,
-                             capture_output=True)
+                             capture_output=True, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
     except FileNotFoundError:
         return {}
     if out.returncode != 0:
@@ -196,14 +206,11 @@ def snapshot(root, excludes):
             i += 1
         if any(p.replace("\\", "/").startswith(x) for x in excludes):
             continue
-        fp = os.path.join(root, p)
-        h = "-"
-        if os.path.isfile(fp):
-            try:
-                with open(fp, "rb") as f:
-                    h = hashlib.sha256(f.read()).hexdigest()
-            except OSError:
-                h = "?"
+        try:
+            s = os.stat(os.path.join(root, p))
+            h = f"{s.st_size}:{s.st_mtime_ns}"
+        except OSError:
+            h = "-"
         snap[p] = [st, h]
     return snap
 
@@ -218,6 +225,7 @@ def git_head(root):
 
 def scan_events(path):
     thread_id, service_tier, usage = None, None, {}
+    browser = {"node_repl_calls": 0, "node_repl_failed": 0, "runtime_setups": 0, "cua_repl_calls": 0, "preflight": None}
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -236,9 +244,43 @@ def scan_events(path):
                     for k, v in ev["usage"].items():
                         if isinstance(v, int):
                             usage[k] = usage.get(k, 0) + v
+                it = ev.get("item") or {}
+                if ev.get("type") != "item.completed":
+                    continue
+                if it.get("type") == "mcp_tool_call" and it.get("server") in ("node_repl", "cua_repl"):
+                    if it["server"] == "cua_repl":
+                        browser["cua_repl_calls"] += 1
+                        continue
+                    browser["node_repl_calls"] += 1
+                    browser["node_repl_failed"] += it.get("status") == "failed"
+                    args = it.get("arguments")
+                    code = (args.get("code") if isinstance(args, dict) else args) or ""
+                    browser["runtime_setups"] += "setupBrowserRuntime(" in str(code)
+                if it.get("type") == "agent_message" and browser["preflight"] is None:
+                    m = re.search(r"BROWSER_PREFLIGHT:\s*(OK|FAIL)[^\n]*", it.get("text") or "")
+                    if m:
+                        browser["preflight"] = m.group(0)[:300]
     except OSError:
         pass
-    return thread_id, service_tier, usage or None
+    return thread_id, service_tier, usage or None, browser
+
+
+def load_sessions(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_session(path, name, session_id):
+    sessions = load_sessions(path)
+    sessions[name] = {"session_id": session_id, "updated_utc": utcnow()}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
 def main():
@@ -247,22 +289,30 @@ def main():
     ap.add_argument("--effort", required=True, choices=["low", "medium", "high", "xhigh"])
     ap.add_argument("--model")
     ap.add_argument("--network", action="store_true")
+    ap.add_argument("--browser", action="store_true",
+                    help="let Codex use the user's browser via the Codex Chrome extension; prepends browser_preflight.md")
+    ap.add_argument("--approvals", choices=["auto", "never"],
+                    help="auto: Auto-review approves or denies sandbox escalations; never: they fail (default: config approvals)")
     ap.add_argument("--fast", dest="fast", action="store_true", default=None)
     ap.add_argument("--no-fast", dest="fast", action="store_false")
     ap.add_argument("--auth", choices=["login", "api"],
                     help="login: the stored `codex login`; api: API key from api_key_env (default: config auth)")
     ap.add_argument("--resume", default="")
+    ap.add_argument("--continue", dest="cont", action="store_true",
+                    help="resume the last session recorded for this --name in this repository")
     ap.add_argument("--wait", type=int, default=0)
     ap.add_argument("--root", default="")
     ap.add_argument("--prompt-file", default="")
     ap.add_argument("--with", dest="extras", action="append", default=[],
-                    help="prepend a named extra preamble from the config (e.g. --with browser)")
+                    help="prepend a named extra preamble from the config (e.g. --with style)")
     a = ap.parse_args()
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", a.name):
         die("--name must be a slug [A-Za-z0-9._-], max 64 chars")
     if a.wait < 0:
         die("--wait must be >= 0")
+    if a.cont and a.resume:
+        die("use either --resume <session_id> or --continue, not both")
 
     root = find_root(a.root or os.getcwd())
     cfg = load_config(root)
@@ -277,6 +327,11 @@ def main():
     if fast and not cfg["allow_fast"]:
         print("Fast is switched off in the config (allow_fast=false); running without it.", file=sys.stderr)
         fast = False
+    approvals = a.approvals or cfg["approvals"]
+    if approvals not in ("auto", "never"):
+        die(f"approvals must be auto or never, not '{approvals}'")
+    if a.browser and not cfg["allow_browser"]:
+        die("--browser is switched off in the config (allow_browser=false)")
 
     auth = a.auth or cfg["auth"]
     if auth not in ("login", "api"):
@@ -296,6 +351,12 @@ def main():
     if not os.path.isfile(preamble):
         die(f"Missing preamble {preamble}")
     extra_files = []
+    if a.browser:
+        p = os.path.expanduser(cfg["browser_preamble"]) if cfg["browser_preamble"] else os.path.join(HERE, "browser_preflight.md")
+        p = p if os.path.isabs(p) else os.path.join(root, p)
+        if not os.path.isfile(p):
+            die(f"Missing browser preamble {p}")
+        extra_files.append(p)
     for x in a.extras:
         p = cfg["extra_preambles"].get(x)
         if not p:
@@ -318,13 +379,20 @@ def main():
     if not user_prompt.strip():
         die("Empty prompt (use --prompt-file or stdin)")
 
+    runs_dir = cfg["runs_dir"] if os.path.isabs(cfg["runs_dir"]) else os.path.join(root, cfg["runs_dir"])
+    sessions_file = os.path.join(runs_dir, "sessions.json")   # --name -> last session id, for --continue
+    resume = a.resume
+    if a.cont:
+        resume = (load_sessions(sessions_file).get(a.name) or {}).get("session_id") or ""
+        if not resume:
+            die(f"--continue: no earlier session recorded for --name {a.name} in {sessions_file}")
+
     lock_dir = os.path.expanduser(cfg["lock_dir"]) if cfg["lock_dir"] else os.path.join(os.path.expanduser("~"), ".codex-worker", "locks")
     slot = acquire_slot(lock_dir, int(cfg["max_concurrent"]), a.wait)
     if not slot:
         die(f"Concurrency limit reached ({cfg['max_concurrent']} Codex runs active). Retry later or use --wait <seconds>.", 75)
 
     try:
-        runs_dir = cfg["runs_dir"] if os.path.isabs(cfg["runs_dir"]) else os.path.join(root, cfg["runs_dir"])
         os.makedirs(runs_dir, exist_ok=True)
         ts = utcnow("%Y%m%dT%H%M%SZ")
         run_dir = os.path.join(runs_dir, f"{ts}_{a.name}")
@@ -341,11 +409,14 @@ def main():
             for p in [preamble] + extra_files:
                 with open(p, encoding="utf-8") as g:
                     f.write(g.read().rstrip("\n") + "\n\n")
+            if approvals == "auto":
+                f.write(APPROVALS_NOTE + "\n\n")
             f.write(user_prompt.rstrip("\n") + "\n")
 
         rel_runs = os.path.relpath(runs_dir, root).replace("\\", "/")
         excludes = [rel_runs.rstrip("/") + "/"] + list(cfg["exclude_from_changes"])
-        before = snapshot(root, excludes)
+        track = cfg["track_changes"]
+        before = snapshot(root, excludes) if track else {}
         head_before = git_head(root)
         start = utcnow()
         is_batch = IS_WIN and codex.lower().endswith((".cmd", ".bat"))
@@ -356,19 +427,20 @@ def main():
             version = "unknown"
 
         quote = "" if IS_WIN else '"'
-        cmd = [codex, "exec"] + (["resume"] if a.resume else []) + [
+        cmd = [codex, "exec"] + (["resume"] if resume else []) + [
             "-m", model,
             "-c", f'model_reasoning_effort={quote}{a.effort}{quote}',
             "-c", f'sandbox_mode={quote}workspace-write{quote}',
-            "-c", f'approval_policy={quote}never{quote}',
+            "-c", f'approval_policy={quote}{"on-request" if approvals == "auto" else "never"}{quote}',
+        ] + (["-c", f'approvals_reviewer={quote}auto_review{quote}'] if approvals == "auto" else []) + [
             "-c", f'service_tier={quote}{"priority" if fast else "default"}{quote}',
             "-c", f"sandbox_workspace_write.network_access={'true' if a.network else 'false'}",
             "--json", "-o", os.path.join(run_dir, "last_message.md"),
         ]
-        if not a.resume:
+        if not resume:
             cmd += ["-C", root]       # `codex exec resume` does not accept -C
         else:
-            cmd += [a.resume]
+            cmd += [resume]
         cmd += ["-"]
         if is_batch:
             cmd = _batch(cmd)
@@ -387,23 +459,28 @@ def main():
                 rc = 130
 
         end = utcnow()
-        after = snapshot(root, excludes)
+        after = snapshot(root, excludes) if track else {}
         head_after = git_head(root)
-        changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
-        thread_id, tier, usage = scan_events(os.path.join(run_dir, "events.jsonl"))
+        changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p)) if track else None
+        thread_id, tier, usage, browser = scan_events(os.path.join(run_dir, "events.jsonl"))
         meta = {
             "name": a.name, "run_dir": run_dir, "cwd": root,
             "start_utc": start, "end_utc": end,
             "codex_bin": codex, "codex_version": version, "model": model,
-            "reasoning_effort": a.effort, "sandbox": "workspace-write", "approval_policy": "never",
+            "reasoning_effort": a.effort, "sandbox": "workspace-write",
+            "approval_policy": "on-request" if approvals == "auto" else "never",
+            "approvals_reviewer": "auto_review" if approvals == "auto" else None,
             "network": a.network,
             "extra_preambles": a.extras,
+            "browser_mode": a.browser,
+            "browser_evidence": browser if a.browser or browser["cua_repl_calls"] or browser["runtime_setups"] else None,
             "fast_mode": "on (service_tier=priority)" if fast else "off (service_tier=default)",
             "service_tier_reported": tier,
             "auth": f"api key ({cfg['api_key_env']})" if auth == "api" else "codex login",
             "usage": usage,
-            "resumed_session_id": a.resume or None,
-            "session_id": thread_id or (a.resume or None),
+            "resumed_session_id": resume or None,
+            "continued": a.cont,
+            "session_id": thread_id or (resume or None),
             "exit_code": rc,
             "git_head_before": head_before, "git_head_after": head_after,
             "git_head_changed": head_before != head_after,
@@ -414,12 +491,16 @@ def main():
         with open(os.path.join(run_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
             f.write("\n")
+        if meta["session_id"]:
+            save_session(sessions_file, a.name, meta["session_id"])
     finally:
         shutil.rmtree(slot, ignore_errors=True)
 
     print(f"RUN_DIR: {run_dir}")
     print(f"EXIT_CODE: {rc}")
     print(f"SESSION_ID: {meta['session_id']}")
+    if meta["browser_evidence"]:
+        print(f"BROWSER: {json.dumps(meta['browser_evidence'], ensure_ascii=False)}")
     print("----- LAST MESSAGE -----")
     lm = os.path.join(run_dir, "last_message.md")
     if os.path.isfile(lm) and os.path.getsize(lm):
